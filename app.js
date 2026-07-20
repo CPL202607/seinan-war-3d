@@ -374,6 +374,7 @@ class FleetUnit {
   }
   setFade(k) {
     const o = k * (this.vis == null ? 1 : this.vis);
+    this.fade = o;
     this.mats.forEach(m => m.opacity = o);
     if (this.trailMat) this.trailMat.opacity = 0.7 * o;
     this.el.style.opacity = o;
@@ -723,6 +724,34 @@ const cityEls = CITIES.map(c => {
   return { el, c };
 });
 
+/* ───────── 標籤碰撞排除 ─────────
+   每幀以螢幕空間矩形檢測重疊，優先序：事件標註 > 部隊 > 城市。
+   部隊標籤逐步上移閃避；城市標籤閃避失敗則暫時隱藏。 */
+function labelSize(el) {
+  if (el._w == null) { el._w = el.offsetWidth; el._h = el.offsetHeight; }
+}
+function clearSizeCache() {
+  cityEls.forEach(({ el }) => { el._w = null; });
+  activeObjects.forEach(o => { if (o.el) o.el._w = null; });
+  calloutEls.forEach(ce => { ce.el._w = null; });
+}
+const frameRects = [];
+function rectOverlaps(x, y, w, h) {
+  for (let i = 0; i < frameRects.length; i++) {
+    const o = frameRects[i];
+    if (x < o.x + o.w + 4 && x + w + 4 > o.x && y < o.y + o.h + 3 && y + h + 3 > o.y) return true;
+  }
+  return false;
+}
+/* 依序嘗試：原位 → 逐步上移 → 逐步下移 */
+const DY_CANDIDATES = [0, -13, -26, -39, -52, -65, -78, -91, -104, 18, 36, 54, 72];
+function findFreeDy(x, yTop, w, h) {
+  for (let i = 0; i < DY_CANDIDATES.length; i++) {
+    if (!rectOverlaps(x, yTop + DY_CANDIDATES[i], w, h)) return DY_CANDIDATES[i];
+  }
+  return DY_CANDIDATES[0];
+}
+
 /* ───────── 主迴圈 ───────── */
 let lastTime = performance.now();
 function resize() {
@@ -730,6 +759,7 @@ function resize() {
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  clearSizeCache();
 }
 addEventListener('resize', resize);
 resize();
@@ -766,17 +796,13 @@ function animate(now) {
   }
   applyCam();
 
-  /* 部隊 */
+  /* 部隊（先更新位置與淡入，標籤稍後統一佈局） */
   state.fade = Math.min(state.fade + dt * 1.8, 1);
   activeObjects.forEach(o => {
     o.update(state.u, dt, time);
     o.setFade(state.fade);
-    if (o.el && o.worldPos) {
-      const s = toScreen(o.worldPos);
-      if (s) { o.el.style.transform = 'translate(-50%,-100%) translate(' + s.x + 'px,' + s.y + 'px)'; o.el.style.display = ''; }
-      else o.el.style.display = 'none';
-    }
   });
+  frameRects.length = 0;
 
   /* 天守於第 3 幕中燒毀 */
   if (state.phase === 2) {
@@ -788,26 +814,56 @@ function animate(now) {
   snowFX.update(dt, cam.t);
   rainFX.update(dt, cam.t);
 
-  /* 標註浮現 */
+  /* 標註浮現（最優先，佔位不閃避） */
   calloutEls.forEach(ce => {
     if (state.u >= ce.co.t && !ce.shown) { ce.shown = true; }
     ce.el.style.opacity = ce.shown ? 1 : 0;
     const y = Math.max(hAt(ce.co.p[0], ce.co.p[1]), 0.3) + 3;
     const s = toScreen(new THREE.Vector3(ce.co.p[0], y, ce.co.p[1]));
-    if (s) { ce.el.style.transform = 'translate(-4px,-50%) translate(' + s.x + 'px,' + s.y + 'px)'; ce.el.style.display = ''; }
-    else ce.el.style.display = 'none';
+    if (s) {
+      let dy = 0;
+      if (ce.shown) {
+        labelSize(ce.el);
+        dy = findFreeDy(s.x - 4, s.y - ce.el._h / 2, ce.el._w, ce.el._h);
+        frameRects.push({ x: s.x - 4, y: s.y - ce.el._h / 2 + dy, w: ce.el._w, h: ce.el._h });
+      }
+      ce.el.style.transform = 'translate(-4px,-50%) translate(' + s.x + 'px,' + (s.y + dy) + 'px)';
+      ce.el.style.display = '';
+    } else ce.el.style.display = 'none';
   });
 
-  /* 城市標籤 */
+  /* 部隊標籤（重疊時逐步上移閃避） */
+  activeObjects.forEach(o => {
+    if (!o.el || !o.worldPos) return;
+    if (o.fade != null && o.fade < 0.04) { o.el.style.display = 'none'; return; }
+    const s = toScreen(o.worldPos);
+    if (!s) { o.el.style.display = 'none'; return; }
+    labelSize(o.el);
+    const dy = findFreeDy(s.x - o.el._w / 2, s.y - o.el._h, o.el._w, o.el._h);
+    frameRects.push({ x: s.x - o.el._w / 2, y: s.y - o.el._h + dy, w: o.el._w, h: o.el._h });
+    o.el.style.transform = 'translate(-50%,-100%) translate(' + s.x + 'px,' + (s.y + dy) + 'px)';
+    o.el.style.display = '';
+  });
+
+  /* 城市標籤（閃避失敗則隱藏） */
   const showMin = cam.r < 190;
   cityEls.forEach(({ el, c }) => {
     if (c.min && !showMin) { el.style.display = 'none'; return; }
     const y = Math.max(hAt(c.p[0], c.p[1]), 0.3) + (c.mtn ? 4 : 1.2);
     const s = toScreen(new THREE.Vector3(c.p[0], y, c.p[1]));
-    if (s && s.x > -50 && s.x < innerWidth + 50 && s.y > -20 && s.y < innerHeight + 20) {
-      el.style.display = '';
-      el.style.transform = 'translate(-50%,-100%) translate(' + s.x + 'px,' + s.y + 'px)';
-    } else el.style.display = 'none';
+    if (!(s && s.x > -50 && s.x < innerWidth + 50 && s.y > -20 && s.y < innerHeight + 20)) {
+      el.style.display = 'none'; return;
+    }
+    labelSize(el);
+    let dy = 0, ok = false;
+    for (let k = 0; k < 3; k++) {
+      if (!rectOverlaps(s.x - el._w / 2, s.y - el._h + dy, el._w, el._h)) { ok = true; break; }
+      dy -= 12;
+    }
+    if (!ok) { el.style.display = 'none'; return; }
+    frameRects.push({ x: s.x - el._w / 2, y: s.y - el._h + dy, w: el._w, h: el._h });
+    el.style.display = '';
+    el.style.transform = 'translate(-50%,-100%) translate(' + s.x + 'px,' + (s.y + dy) + 'px)';
   });
 
   /* 進度條、羅盤、比例尺 */
